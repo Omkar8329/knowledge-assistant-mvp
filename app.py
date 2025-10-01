@@ -1,4 +1,4 @@
-# app.py — Knowledge Assistant (MVP, Interactive + AI RAG)
+# app.py — Knowledge Assistant (MVP, Gemini RAG, no quick prompts)
 
 import os
 import io
@@ -247,7 +247,7 @@ def answer_with_sentences(question: str, retrieved: List[Dict], top_sentences: i
     return {"answer": answer_text, "citations": citations}
 
 # ----------------------------
-# LLM synthesis over retrieved chunks (RAG)
+# Gemini synthesis over retrieved chunks (RAG)
 # ----------------------------
 def _compose_context_from_chunks(retrieved, max_chars=12000):
     parts, total = [], 0
@@ -261,42 +261,32 @@ def _compose_context_from_chunks(retrieved, max_chars=12000):
         parts.append(piece); total += len(piece)
     return "".join(parts)
 
-def llm_answer_from_context(question, retrieved, model="gpt-4o-mini", temperature=0.2):
-    """Use OpenAI to write a clear answer based ONLY on the retrieved context."""
+def gemini_answer_from_context(question, retrieved, model_name="gemini-1.5-flash", temperature=0.2):
+    """Use Google Gemini to answer based ONLY on the retrieved context."""
     if not retrieved:
         return {"answer": "No relevant content found in the knowledge base for this question.", "citations": []}
 
-    api_key = os.getenv("OPENAI_API_KEY")
+    api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
-        return {"answer": "AI mode is enabled but no OPENAI_API_KEY is set. Use the extractive mode or set a key.", "citations": []}
+        return {"answer": "AI mode is enabled but no GEMINI_API_KEY is set. Use Fast mode or set a key.", "citations": []}
 
-    # Lazy import to keep runtime light if AI is off
-    import openai
-    openai.api_key = api_key
+    # Lazy import & configure
+    import google.generativeai as genai
+    genai.configure(api_key=api_key)
 
     context = _compose_context_from_chunks(retrieved)
-    prompt = f"""
-You are a helpful assistant answering questions strictly from the provided context.
-- If the answer is not in the context, say you cannot find it.
-- Quote short phrases when useful and include filenames/pages in square brackets like [filename p.3].
-- Be concise and precise for business users.
-
-Question: {question}
-
-CONTEXT:
-{context}
-    """.strip()
+    instruction = (
+        "You are a helpful assistant that answers strictly from the provided context. "
+        "If the answer is not present, state that you cannot find it in the documents. "
+        "Quote short phrases when helpful and include filename/page in square brackets like [file p.3]. "
+        "Write concisely for business users."
+    )
+    prompt = f"{instruction}\n\nQuestion: {question}\n\nCONTEXT:\n{context}"
 
     try:
-        resp = openai.ChatCompletion.create(
-            model=model,
-            temperature=temperature,
-            messages=[
-                {"role": "system", "content": "You answer using only the supplied context. If missing, say you can't find it."},
-                {"role": "user", "content": prompt},
-            ],
-        )
-        answer = resp.choices[0].message["content"].strip()
+        model = genai.GenerativeModel(model_name)
+        resp = model.generate_content(prompt, generation_config={"temperature": temperature})
+        answer = (resp.text or "").strip()
 
         citations = []
         for r in retrieved[:4]:
@@ -307,7 +297,7 @@ CONTEXT:
                 "score": r["score"],
                 "preview": ch["text"][:200] + ("..." if len(ch["text"]) > 200 else "")
             })
-        return {"answer": answer, "citations": citations}
+        return {"answer": answer or "No answer produced by the model.", "citations": citations}
     except Exception as e:
         return {"answer": f"LLM error: {e}", "citations": []}
 
@@ -379,157 +369,4 @@ def export_answer_pdf(path: Path, question: str, answer: str, citations: List[Di
             y = height - margin
             c.setFont("Helvetica", size)
 
-    c.setTitle("Knowledge Assistant — Answer Export")
-    line(f"{APP_TITLE} — Export", 14, 18)
-    line(f"Workspace: {workspace}", 10, 14)
-    line(f"Generated: {datetime.utcnow().isoformat()}Z", 8, 12)
-    line("")
-    line("Question:", 12)
-    for row in textwrap.wrap(question or "", 100): line(row)
-    line("")
-    line("Answer:", 12)
-    for row in textwrap.wrap(answer or "", 100): line(row)
-    line("")
-    line("Citations:", 12)
-    for cit in citations or []:
-        page = f"(p. {cit.get('page')})" if cit.get("page") else ""
-        line(f"- {cit.get('filename','')} {page} — score {cit.get('score',0):.3f}")
-        for row in textwrap.wrap(cit.get('preview',''), 100): line(f"  {row}")
-    c.save()
-
-# ----------------------------
-# UI
-# ----------------------------
-def main():
-    check_auth()
-    st.title(APP_TITLE)
-
-    # Sidebar / Workspace
-    st.sidebar.header("Workspace")
-    existing = sorted([p.name for p in DATA_DIR.iterdir() if p.is_dir()])
-    ws = st.sidebar.text_input("Name", value=(existing[0] if existing else "default"))
-    if st.sidebar.button("Create/Use"):
-        st.session_state.workspace = ws
-    if "workspace" not in st.session_state:
-        st.session_state.workspace = ws
-    ws = st.session_state.workspace
-    st.sidebar.write(f"Active: **{ws}**")
-
-    store = Store(ws)
-
-    if st.sidebar.button("Reset workspace"):
-        store.reset()
-        st.success("Workspace reset. (All files & index cleared)")
-
-    # Upload & Ingest
-    st.subheader("Upload documents")
-    files = st.file_uploader("Add PDF / DOCX / TXT", type=["pdf", "docx", "txt"], accept_multiple_files=True)
-    if st.button("Ingest & Index") and files:
-        with st.spinner("Indexing…"):
-            total = 0
-            for f in files:
-                try:
-                    total += store.add(f.name, f.getvalue())
-                except Exception as e:
-                    st.error(f"{f.name}: {e}")
-            st.success(f"Indexed chunks: {total}")
-
-    # Tabs
-    tab_ask, tab_explain, tab_chunks = st.tabs(["❓ Ask", "📘 Explain", "🧩 Chunks"])
-
-    # --- Ask Tab ---
-    with tab_ask:
-        c1, c2, c3 = st.columns([3, 1, 1])
-        with c1:
-            question = st.text_input("Ask a question", placeholder="e.g., What is the renewal date and notice period?")
-        with c2:
-            top_k = st.number_input("Top-K chunks", min_value=1, max_value=20, value=TOP_K_CHUNKS, step=1)
-        with c3:
-            top_sents = st.number_input("Sentences in answer", min_value=1, max_value=10, value=TOP_SENTENCES, step=1)
-
-        # AI mode
-        ai_col1, ai_col2 = st.columns([1.2, 2])
-        with ai_col1:
-            use_ai = st.checkbox("Use AI (generative)", value=True)
-        with ai_col2:
-            model = st.selectbox("Model", ["gpt-4o-mini", "gpt-4o"], index=0)
-
-        # Smart prompts
-        st.caption("Quick prompts")
-        sp1, sp2, sp3, sp4, sp5 = st.columns(5)
-        if sp1.button("Renewal date?"): question = "When does the agreement renew?"
-        if sp2.button("Notice period?"): question = "What notice period is required to cancel?"
-        if sp3.button("Fees & payment?"): question = "What are the fees and payment terms?"
-        if sp4.button("Uptime/SLA?"): question = "What is the uptime guarantee and service credits?"
-        if sp5.button("Governing law?"): question = "What is the governing law and venue?"
-
-        if st.button("Answer"):
-            with st.spinner("Working…"):
-                results = store.search(question, top_k=top_k)
-                if use_ai:
-                    out = llm_answer_from_context(question, results, model=model)
-                else:
-                    out = answer_with_sentences(question, results, top_sentences=top_sents)
-
-            st.markdown("### Answer")
-            st.write(out["answer"] or "_No answer_")
-
-            st.markdown("### Citations")
-            if out["citations"]:
-                for citem in out["citations"]:
-                    page = f"(p. {citem['page']})" if citem.get("page") else ""
-                    st.markdown(f"- **{citem['filename']}** {page} — score `{citem['score']:.3f}`\n\n> {citem['preview']}")
-            else:
-                st.write("_No citations_")
-
-            # Export PDF
-            export_name = f"answer_{uuid.uuid4().hex[:8]}.pdf"
-            export_path = DATA_DIR / ws / export_name
-            export_answer_pdf(export_path, question, out["answer"], out["citations"], ws)
-            with open(export_path, "rb") as fh:
-                st.download_button("⬇️ Download answer as PDF", data=fh, file_name=export_name, mime="application/pdf")
-
-    # --- Explain Tab ---
-    with tab_explain:
-        st.write("Get a quick overview and key facts extracted from your documents.")
-        if not store.raw_pages:
-            st.info("Upload and ingest documents first.")
-        else:
-            colA, colB = st.columns([2, 1])
-            with colA:
-                if st.button("Explain this workspace"):
-                    with st.spinner("Summarizing…"):
-                        summary = summarize_workspace(store.raw_pages, max_sentences=8)
-                    st.markdown("### Summary")
-                    st.write(summary)
-            with colB:
-                st.markdown("### Key facts")
-                facts = extract_key_facts(store.raw_pages)
-                for k, items in facts.items():
-                    if not items:
-                        continue
-                    with st.expander(k, expanded=(k in ["Renewal / Termination", "Fees & Payment", "Notice Periods"])):
-                        for it in items[:10]:
-                            page = f"(p. {it.get('page')})" if it.get("page") else ""
-                            st.markdown(f"- {it['text']}  \n  _{it['filename']} {page}_")
-
-            st.caption("Tip: Use the Ask tab to dig deeper into any of these facts.")
-
-    # --- Chunks Tab ---
-    with tab_chunks:
-        if not store.meta["chunks"]:
-            st.info("No chunks indexed yet.")
-        else:
-            st.write(f"**Documents:** {len(store.meta['docs'])} • **Chunks:** {len(store.meta['chunks'])}")
-            filenames = ["All"] + [d["filename"] for d in store.meta["docs"]]
-            pick = st.selectbox("Filter by file", filenames)
-            shown = [c for c in store.meta["chunks"] if pick == "All" or c["filename"] == pick]
-            start = st.number_input("Start at chunk #", 0, max(0, len(shown) - 1), 0, 10)
-            for c in shown[start:start+30]:
-                st.markdown(f"**{c['filename']}**  (page {c.get('page')}) — id `{c['id'][:8]}`")
-                st.code(c["text"][:1500] + ("..." if len(c["text"]) > 1500 else ""))
-
-    st.caption("Answers are grounded in your documents. Verify critical decisions with the source files.")
-
-if __name__ == "__main__":
-    main()
+    c.setTitle("Knowledge Assi
