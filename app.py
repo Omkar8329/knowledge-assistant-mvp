@@ -1,16 +1,11 @@
-# app.py — Knowledge Assistant (MVP)
-# Clean Streamlit app (no Colab magics). Includes:
-# - Password gate via APP_PASSWORD
-# - Upload PDF/DOCX/TXT
-# - TF-IDF retrieval + sentence extraction
-# - Answer + citations + PDF export
-# - Per-workspace storage under DATA_DIR (defaults to ./data)
+# app.py — Knowledge Assistant (MVP, Interactive + AI RAG)
 
 import os
 import io
 import re
 import json
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Tuple
 
@@ -28,7 +23,7 @@ from reportlab.pdfgen import canvas
 from reportlab.lib.units import inch
 
 # ----------------------------
-# Config
+# App config
 # ----------------------------
 APP_TITLE = "Knowledge Assistant (MVP)"
 DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
@@ -40,9 +35,7 @@ TOP_K_CHUNKS = 6
 TOP_SENTENCES = 4
 SENTENCE_SPLIT_RE = re.compile(r'(?<=[.!?])\s+(?=[A-Z0-9“"(])')
 
-# First Streamlit call must be set_page_config
 st.set_page_config(page_title=APP_TITLE, layout="wide")
-
 
 # ----------------------------
 # Auth (single password via env)
@@ -55,7 +48,6 @@ def check_auth():
         st.session_state.authed = False
     if st.session_state.authed:
         return True
-
     st.title(APP_TITLE)
     st.info("Enter password to continue.")
     pwd = st.text_input("Password", type="password")
@@ -67,9 +59,8 @@ def check_auth():
             st.error("Wrong password.")
     st.stop()
 
-
 # ----------------------------
-# File readers & text utils
+# Readers & text utils
 # ----------------------------
 def read_pdf(file_bytes: bytes) -> List[Tuple[str, int]]:
     out = []
@@ -121,9 +112,8 @@ def split_sentences(text: str) -> List[str]:
                 sentences.append(s)
     return sentences
 
-
 # ----------------------------
-# Simple TF-IDF store (per workspace)
+# TF-IDF store (per workspace)
 # ----------------------------
 class Store:
     def __init__(self, workspace: str):
@@ -131,8 +121,11 @@ class Store:
         self.dir = DATA_DIR / workspace
         self.dir.mkdir(exist_ok=True, parents=True)
         self.meta_path = self.dir / "meta.json"
+        self.raw_path = self.dir / "raw.json"  # raw pages for Explain/Explore
 
         self.meta = {"docs": [], "chunks": []}
+        self.raw_pages: Dict[str, List[Dict]] = {}
+
         self.vectorizer: TfidfVectorizer | None = None
         self.matrix = None
         self._load()
@@ -140,13 +133,14 @@ class Store:
     def _load(self):
         if self.meta_path.exists():
             self.meta = json.loads(self.meta_path.read_text(encoding="utf-8"))
-        if self.meta["chunks"]:
+        if self.raw_path.exists():
+            self.raw_pages = json.loads(self.raw_path.read_text(encoding="utf-8"))
+        if self.meta.get("chunks"):
             self._rebuild_index()
 
     def _save(self):
-        self.meta_path.write_text(
-            json.dumps(self.meta, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        self.meta_path.write_text(json.dumps(self.meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.raw_path.write_text(json.dumps(self.raw_pages, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def reset(self):
         for p in self.dir.glob("*"):
@@ -155,6 +149,7 @@ class Store:
             except:
                 pass
         self.meta = {"docs": [], "chunks": []}
+        self.raw_pages = {}
         self.vectorizer = None
         self.matrix = None
 
@@ -164,40 +159,29 @@ class Store:
             lowercase=True, stop_words="english", ngram_range=(1, 2),
             max_features=100_000, norm="l2"
         )
-        self.matrix = self.vectorizer.fit_transform(texts)
+        self.matrix = self.vectorizer.fit_transform(texts) if texts else None
 
     def add(self, filename: str, file_bytes: bytes) -> int:
         ext = filename.lower().split(".")[-1]
         entries = []
 
         if ext == "pdf":
-            for page_text, page_no in read_pdf(file_bytes):
+            pages = read_pdf(file_bytes)
+            self.raw_pages[filename] = [{"page": i, "text": clean_text(t)} for (t, i) in pages]
+            for page_text, page_no in pages:
                 text = clean_text(page_text)
                 for ch in chunk_text(text):
-                    entries.append({
-                        "id": str(uuid.uuid4()),
-                        "filename": filename,
-                        "page": page_no,
-                        "text": ch
-                    })
+                    entries.append({"id": str(uuid.uuid4()), "filename": filename, "page": page_no, "text": ch})
         elif ext == "docx":
             text = clean_text(read_docx(file_bytes))
+            self.raw_pages[filename] = [{"page": None, "text": text}]
             for ch in chunk_text(text):
-                entries.append({
-                    "id": str(uuid.uuid4()),
-                    "filename": filename,
-                    "page": None,
-                    "text": ch
-                })
+                entries.append({"id": str(uuid.uuid4()), "filename": filename, "page": None, "text": ch})
         elif ext == "txt":
             text = clean_text(read_txt(file_bytes))
+            self.raw_pages[filename] = [{"page": None, "text": text}]
             for ch in chunk_text(text):
-                entries.append({
-                    "id": str(uuid.uuid4()),
-                    "filename": filename,
-                    "page": None,
-                    "text": ch
-                })
+                entries.append({"id": str(uuid.uuid4()), "filename": filename, "page": None, "text": ch})
         else:
             raise ValueError(f"Unsupported file type: .{ext}")
 
@@ -218,9 +202,8 @@ class Store:
         top_idx = np.argsort(-sims)[:top_k]
         return [{"score": float(sims[i]), "chunk": self.meta["chunks"][i]} for i in top_idx]
 
-
 # ----------------------------
-# Answer composer (select top sentences)
+# Extractive answer (fast)
 # ----------------------------
 def answer_with_sentences(question: str, retrieved: List[Dict], top_sentences: int = TOP_SENTENCES) -> Dict:
     if not retrieved:
@@ -263,23 +246,133 @@ def answer_with_sentences(question: str, retrieved: List[Dict], top_sentences: i
 
     return {"answer": answer_text, "citations": citations}
 
+# ----------------------------
+# LLM synthesis over retrieved chunks (RAG)
+# ----------------------------
+def _compose_context_from_chunks(retrieved, max_chars=12000):
+    parts, total = [], 0
+    for r in retrieved:
+        ch = r["chunk"]
+        header = f"[FILE: {ch['filename']}" + (f" | PAGE: {ch.get('page')}" if ch.get("page") else "") + "]\n"
+        body = ch["text"].strip()
+        piece = header + body + "\n\n"
+        if total + len(piece) > max_chars:
+            break
+        parts.append(piece); total += len(piece)
+    return "".join(parts)
+
+def llm_answer_from_context(question, retrieved, model="gpt-4o-mini", temperature=0.2):
+    """Use OpenAI to write a clear answer based ONLY on the retrieved context."""
+    if not retrieved:
+        return {"answer": "No relevant content found in the knowledge base for this question.", "citations": []}
+
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return {"answer": "AI mode is enabled but no OPENAI_API_KEY is set. Use the extractive mode or set a key.", "citations": []}
+
+    # Lazy import to keep runtime light if AI is off
+    import openai
+    openai.api_key = api_key
+
+    context = _compose_context_from_chunks(retrieved)
+    prompt = f"""
+You are a helpful assistant answering questions strictly from the provided context.
+- If the answer is not in the context, say you cannot find it.
+- Quote short phrases when useful and include filenames/pages in square brackets like [filename p.3].
+- Be concise and precise for business users.
+
+Question: {question}
+
+CONTEXT:
+{context}
+    """.strip()
+
+    try:
+        resp = openai.ChatCompletion.create(
+            model=model,
+            temperature=temperature,
+            messages=[
+                {"role": "system", "content": "You answer using only the supplied context. If missing, say you can't find it."},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        answer = resp.choices[0].message["content"].strip()
+
+        citations = []
+        for r in retrieved[:4]:
+            ch = r["chunk"]
+            citations.append({
+                "filename": ch["filename"],
+                "page": ch.get("page"),
+                "score": r["score"],
+                "preview": ch["text"][:200] + ("..." if len(ch["text"]) > 200 else "")
+            })
+        return {"answer": answer, "citations": citations}
+    except Exception as e:
+        return {"answer": f"LLM error: {e}", "citations": []}
 
 # ----------------------------
-# PDF Export (safe version)
+# Summarize & key facts (heuristics)
+# ----------------------------
+def extract_key_facts(raw_pages: Dict[str, List[Dict]]) -> Dict[str, List[Dict]]:
+    facts = {
+        "Dates": [],
+        "Notice Periods": [],
+        "Fees & Payment": [],
+        "Percentages (SLA/others)": [],
+        "Governing Law / Venue": [],
+        "Renewal / Termination": [],
+    }
+    date_re = re.compile(r"\b(\d{1,2}\s+\w+\s+\d{4}|\w+\s+\d{1,2},\s*\d{4}|\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{2,4})\b", re.I)
+    notice_re = re.compile(r"\b(\d{1,3})\s*(day|days|business days|calendar days)\b.*(notice|non[- ]?renewal|termination)", re.I)
+    fee_re = re.compile(r"\$?\s?\b(\d{1,3}(?:[,\s]\d{3})*(?:\.\d{2})?)\b.*(per\s*(month|year|annum)|subscription|fee|invoice|net\s*\d+)", re.I)
+    pct_re = re.compile(r"\b(\d{1,3}(?:\.\d+)?)\s*%\b", re.I)
+    law_re = re.compile(r"\b(governing law|jurisdiction|venue|laws of)\b.*", re.I)
+    renew_re = re.compile(r"\b(renew|renewal|auto[- ]?renew|terminate|termination|initial term)\b.*", re.I)
+
+    for fname, pages in raw_pages.items():
+        for p in pages:
+            text = p.get("text") or ""
+            page = p.get("page")
+            for ln in [ln.strip() for ln in text.split("\n") if ln.strip()]:
+                if date_re.search(ln):   facts["Dates"].append({"text": ln, "filename": fname, "page": page})
+                if notice_re.search(ln): facts["Notice Periods"].append({"text": ln, "filename": fname, "page": page})
+                if fee_re.search(ln):    facts["Fees & Payment"].append({"text": ln, "filename": fname, "page": page})
+                if pct_re.search(ln):    facts["Percentages (SLA/others)"].append({"text": ln, "filename": fname, "page": page})
+                if law_re.search(ln):    facts["Governing Law / Venue"].append({"text": ln, "filename": fname, "page": page})
+                if renew_re.search(ln):  facts["Renewal / Termination"].append({"text": ln, "filename": fname, "page": page})
+    return facts
+
+def summarize_workspace(raw_pages: Dict[str, List[Dict]], max_sentences: int = 8) -> str:
+    all_sentences = []
+    for _, pages in raw_pages.items():
+        for p in pages:
+            for s in split_sentences(p.get("text") or ""):
+                if len(s) >= 40:
+                    all_sentences.append(s)
+    if not all_sentences:
+        return "No content available to summarize."
+    vec = TfidfVectorizer(lowercase=True, stop_words="english", ngram_range=(1, 2))
+    X = vec.fit_transform(all_sentences)
+    scores = (X.sum(axis=1)).A.ravel()
+    idx = np.argsort(-scores)[:max_sentences]
+    return " ".join([all_sentences[i] for i in idx])
+
+# ----------------------------
+# PDF export (answer + citations)
 # ----------------------------
 def export_answer_pdf(path: Path, question: str, answer: str, citations: List[Dict], workspace: str):
     import textwrap
-
     c = canvas.Canvas(str(path), pagesize=letter)
     width, height = letter
     margin = 0.75 * inch
     x = margin
     y = height - margin
 
-    def write_line(text: str, size: int = 11, leading: int = 14):
+    def line(t, size=11, leading=14):
         nonlocal y
         c.setFont("Helvetica", size)
-        c.drawString(x, y, text)
+        c.drawString(x, y, t)
         y -= leading
         if y < margin:
             c.showPage()
@@ -287,35 +380,22 @@ def export_answer_pdf(path: Path, question: str, answer: str, citations: List[Di
             c.setFont("Helvetica", size)
 
     c.setTitle("Knowledge Assistant — Answer Export")
-
-    # Header
-    write_line(f"{APP_TITLE} — Export", size=14, leading=18)
-    write_line(f"Workspace: {workspace}", size=10, leading=14)
-    write_line("")
-
-    # Question
-    write_line("Question:", size=12)
-    for row in textwrap.wrap(question or "", width=100):
-        write_line(row)
-    write_line("")
-
-    # Answer
-    write_line("Answer:", size=12)
-    for row in textwrap.wrap(answer or "", width=100):
-        write_line(row)
-    write_line("")
-
-    # Citations
-    write_line("Citations:", size=12)
+    line(f"{APP_TITLE} — Export", 14, 18)
+    line(f"Workspace: {workspace}", 10, 14)
+    line(f"Generated: {datetime.utcnow().isoformat()}Z", 8, 12)
+    line("")
+    line("Question:", 12)
+    for row in textwrap.wrap(question or "", 100): line(row)
+    line("")
+    line("Answer:", 12)
+    for row in textwrap.wrap(answer or "", 100): line(row)
+    line("")
+    line("Citations:", 12)
     for cit in citations or []:
         page = f"(p. {cit.get('page')})" if cit.get("page") else ""
-        write_line(f"- {cit.get('filename','')} {page} — score {cit.get('score',0):.3f}")
-        preview = cit.get("preview", "")
-        for row in textwrap.wrap(preview, width=100):
-            write_line(f"  {row}")
-
+        line(f"- {cit.get('filename','')} {page} — score {cit.get('score',0):.3f}")
+        for row in textwrap.wrap(cit.get('preview',''), 100): line(f"  {row}")
     c.save()
-
 
 # ----------------------------
 # UI
@@ -324,7 +404,7 @@ def main():
     check_auth()
     st.title(APP_TITLE)
 
-    # Workspace
+    # Sidebar / Workspace
     st.sidebar.header("Workspace")
     existing = sorted([p.name for p in DATA_DIR.iterdir() if p.is_dir()])
     ws = st.sidebar.text_input("Name", value=(existing[0] if existing else "default"))
@@ -337,57 +417,119 @@ def main():
 
     store = Store(ws)
 
-    # Reset workspace
     if st.sidebar.button("Reset workspace"):
         store.reset()
         st.success("Workspace reset. (All files & index cleared)")
 
-    # Upload & ingest
-    st.subheader("1) Upload documents")
+    # Upload & Ingest
+    st.subheader("Upload documents")
     files = st.file_uploader("Add PDF / DOCX / TXT", type=["pdf", "docx", "txt"], accept_multiple_files=True)
     if st.button("Ingest & Index") and files:
-        total = 0
-        for f in files:
-            try:
-                total += store.add(f.name, f.getvalue())
-            except Exception as e:
-                st.error(f"{f.name}: {e}")
-        st.success(f"Indexed chunks: {total}")
+        with st.spinner("Indexing…"):
+            total = 0
+            for f in files:
+                try:
+                    total += store.add(f.name, f.getvalue())
+                except Exception as e:
+                    st.error(f"{f.name}: {e}")
+            st.success(f"Indexed chunks: {total}")
 
-    # Ask a question
-    st.subheader("2) Ask a question")
-    c1, c2, c3 = st.columns([3, 1, 1])
-    with c1:
-        question = st.text_input("Your question", placeholder="e.g., What is the renewal date and notice period?")
-    with c2:
-        top_k = st.number_input("Top-K chunks", min_value=1, max_value=20, value=TOP_K_CHUNKS, step=1)
-    with c3:
-        top_sents = st.number_input("Sentences in answer", min_value=1, max_value=10, value=TOP_SENTENCES, step=1)
+    # Tabs
+    tab_ask, tab_explain, tab_chunks = st.tabs(["❓ Ask", "📘 Explain", "🧩 Chunks"])
 
-    if st.button("Answer"):
-        results = store.search(question, top_k=top_k)
-        out = answer_with_sentences(question, results, top_sentences=top_sents)
+    # --- Ask Tab ---
+    with tab_ask:
+        c1, c2, c3 = st.columns([3, 1, 1])
+        with c1:
+            question = st.text_input("Ask a question", placeholder="e.g., What is the renewal date and notice period?")
+        with c2:
+            top_k = st.number_input("Top-K chunks", min_value=1, max_value=20, value=TOP_K_CHUNKS, step=1)
+        with c3:
+            top_sents = st.number_input("Sentences in answer", min_value=1, max_value=10, value=TOP_SENTENCES, step=1)
 
-        st.markdown("### Answer")
-        st.write(out["answer"] or "_No answer_")
+        # AI mode
+        ai_col1, ai_col2 = st.columns([1.2, 2])
+        with ai_col1:
+            use_ai = st.checkbox("Use AI (generative)", value=True)
+        with ai_col2:
+            model = st.selectbox("Model", ["gpt-4o-mini", "gpt-4o"], index=0)
 
-        st.markdown("### Citations")
-        if out["citations"]:
-            for citem in out["citations"]:
-                page = f"(p. {citem['page']})" if citem.get("page") else ""
-                st.markdown(f"- **{citem['filename']}** {page} — score `{citem['score']:.3f}`\n\n> {citem['preview']}")
+        # Smart prompts
+        st.caption("Quick prompts")
+        sp1, sp2, sp3, sp4, sp5 = st.columns(5)
+        if sp1.button("Renewal date?"): question = "When does the agreement renew?"
+        if sp2.button("Notice period?"): question = "What notice period is required to cancel?"
+        if sp3.button("Fees & payment?"): question = "What are the fees and payment terms?"
+        if sp4.button("Uptime/SLA?"): question = "What is the uptime guarantee and service credits?"
+        if sp5.button("Governing law?"): question = "What is the governing law and venue?"
+
+        if st.button("Answer"):
+            with st.spinner("Working…"):
+                results = store.search(question, top_k=top_k)
+                if use_ai:
+                    out = llm_answer_from_context(question, results, model=model)
+                else:
+                    out = answer_with_sentences(question, results, top_sentences=top_sents)
+
+            st.markdown("### Answer")
+            st.write(out["answer"] or "_No answer_")
+
+            st.markdown("### Citations")
+            if out["citations"]:
+                for citem in out["citations"]:
+                    page = f"(p. {citem['page']})" if citem.get("page") else ""
+                    st.markdown(f"- **{citem['filename']}** {page} — score `{citem['score']:.3f}`\n\n> {citem['preview']}")
+            else:
+                st.write("_No citations_")
+
+            # Export PDF
+            export_name = f"answer_{uuid.uuid4().hex[:8]}.pdf"
+            export_path = DATA_DIR / ws / export_name
+            export_answer_pdf(export_path, question, out["answer"], out["citations"], ws)
+            with open(export_path, "rb") as fh:
+                st.download_button("⬇️ Download answer as PDF", data=fh, file_name=export_name, mime="application/pdf")
+
+    # --- Explain Tab ---
+    with tab_explain:
+        st.write("Get a quick overview and key facts extracted from your documents.")
+        if not store.raw_pages:
+            st.info("Upload and ingest documents first.")
         else:
-            st.write("_No citations_")
+            colA, colB = st.columns([2, 1])
+            with colA:
+                if st.button("Explain this workspace"):
+                    with st.spinner("Summarizing…"):
+                        summary = summarize_workspace(store.raw_pages, max_sentences=8)
+                    st.markdown("### Summary")
+                    st.write(summary)
+            with colB:
+                st.markdown("### Key facts")
+                facts = extract_key_facts(store.raw_pages)
+                for k, items in facts.items():
+                    if not items:
+                        continue
+                    with st.expander(k, expanded=(k in ["Renewal / Termination", "Fees & Payment", "Notice Periods"])):
+                        for it in items[:10]:
+                            page = f"(p. {it.get('page')})" if it.get("page") else ""
+                            st.markdown(f"- {it['text']}  \n  _{it['filename']} {page}_")
 
-        # Export PDF
-        export_name = f"answer_{uuid.uuid4().hex[:8]}.pdf"
-        export_path = DATA_DIR / ws / export_name
-        export_answer_pdf(export_path, question, out["answer"], out["citations"], ws)
-        with open(export_path, "rb") as fh:
-            st.download_button("⬇️ Download answer as PDF", data=fh, file_name=export_name, mime="application/pdf")
+            st.caption("Tip: Use the Ask tab to dig deeper into any of these facts.")
 
-    st.caption("Tip: create one workspace per client. Data is stored under DATA_DIR/workspace.")
+    # --- Chunks Tab ---
+    with tab_chunks:
+        if not store.meta["chunks"]:
+            st.info("No chunks indexed yet.")
+        else:
+            st.write(f"**Documents:** {len(store.meta['docs'])} • **Chunks:** {len(store.meta['chunks'])}")
+            filenames = ["All"] + [d["filename"] for d in store.meta["docs"]]
+            pick = st.selectbox("Filter by file", filenames)
+            shown = [c for c in store.meta["chunks"] if pick == "All" or c["filename"] == pick]
+            start = st.number_input("Start at chunk #", 0, max(0, len(shown) - 1), 0, 10)
+            for c in shown[start:start+30]:
+                st.markdown(f"**{c['filename']}**  (page {c.get('page')}) — id `{c['id'][:8]}`")
+                st.code(c["text"][:1500] + ("..." if len(c["text"]) > 1500 else ""))
 
+    st.caption("Answers are grounded in your documents. Verify critical decisions with the source files.")
 
 if __name__ == "__main__":
     main()
