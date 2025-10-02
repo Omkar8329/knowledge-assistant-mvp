@@ -1,4 +1,4 @@
-# app.py — Knowledge Assistant (MVP, Gemini RAG, no quick prompts)
+# app.py — Knowledge Assistant (MVP) with DeepSeek RAG (no quick prompts)
 
 import os
 import io
@@ -22,9 +22,6 @@ from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 from reportlab.lib.units import inch
 
-# ----------------------------
-# App config
-# ----------------------------
 APP_TITLE = "Knowledge Assistant (MVP)"
 DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
 DATA_DIR.mkdir(exist_ok=True, parents=True)
@@ -38,7 +35,7 @@ SENTENCE_SPLIT_RE = re.compile(r'(?<=[.!?])\s+(?=[A-Z0-9“"(])')
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 
 # ----------------------------
-# Auth (single password via env)
+# Auth (single password)
 # ----------------------------
 def check_auth():
     required = os.getenv("APP_PASSWORD")
@@ -121,7 +118,7 @@ class Store:
         self.dir = DATA_DIR / workspace
         self.dir.mkdir(exist_ok=True, parents=True)
         self.meta_path = self.dir / "meta.json"
-        self.raw_path = self.dir / "raw.json"  # raw pages for Explain/Explore
+        self.raw_path = self.dir / "raw.json"
 
         self.meta = {"docs": [], "chunks": []}
         self.raw_pages: Dict[str, List[Dict]] = {}
@@ -247,7 +244,7 @@ def answer_with_sentences(question: str, retrieved: List[Dict], top_sentences: i
     return {"answer": answer_text, "citations": citations}
 
 # ----------------------------
-# Gemini synthesis over retrieved chunks (RAG)
+# DeepSeek synthesis over retrieved chunks (RAG)
 # ----------------------------
 def _compose_context_from_chunks(retrieved, max_chars=12000):
     parts, total = [], 0
@@ -261,32 +258,36 @@ def _compose_context_from_chunks(retrieved, max_chars=12000):
         parts.append(piece); total += len(piece)
     return "".join(parts)
 
-def gemini_answer_from_context(question, retrieved, model_name="gemini-1.5-flash", temperature=0.2):
-    """Use Google Gemini to answer based ONLY on the retrieved context."""
+def deepseek_answer_from_context(question, retrieved, model="deepseek-chat", temperature=0.2):
+    """
+    Use DeepSeek to answer based ONLY on the retrieved context.
+    Models: 'deepseek-chat' (default), 'deepseek-reasoner'
+    """
     if not retrieved:
         return {"answer": "No relevant content found in the knowledge base for this question.", "citations": []}
 
-    api_key = os.getenv("GEMINI_API_KEY")
+    api_key = os.getenv("DEEPSEEK_API_KEY")
     if not api_key:
-        return {"answer": "AI mode is enabled but no GEMINI_API_KEY is set. Use Fast mode or set a key.", "citations": []}
+        return {"answer": "AI mode is enabled but no DEEPSEEK_API_KEY is set. Use Fast mode or set a key.", "citations": []}
 
-    # Lazy import & configure
-    import google.generativeai as genai
-    genai.configure(api_key=api_key)
+    # OpenAI-compatible client pointed to DeepSeek
+    from openai import OpenAI
+    client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
 
     context = _compose_context_from_chunks(retrieved)
-    instruction = (
-        "You are a helpful assistant that answers strictly from the provided context. "
-        "If the answer is not present, state that you cannot find it in the documents. "
-        "Quote short phrases when helpful and include filename/page in square brackets like [file p.3]. "
-        "Write concisely for business users."
-    )
-    prompt = f"{instruction}\n\nQuestion: {question}\n\nCONTEXT:\n{context}"
+    system = "Answer strictly from the provided context. If missing, say you cannot find it. Be concise for business users."
+    user = f"Question: {question}\n\nCONTEXT:\n{context}"
 
     try:
-        model = genai.GenerativeModel(model_name)
-        resp = model.generate_content(prompt, generation_config={"temperature": temperature})
-        answer = (resp.text or "").strip()
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            temperature=temperature,
+        )
+        answer = (resp.choices[0].message.content or "").strip()
 
         citations = []
         for r in retrieved[:4]:
@@ -437,18 +438,18 @@ def main():
         with c3:
             top_sents = st.number_input("Sentences in answer", min_value=1, max_value=10, value=TOP_SENTENCES, step=1)
 
-        # AI mode (Gemini)
+        # AI mode (DeepSeek)
         ai_col1, ai_col2 = st.columns([1.3, 2])
         with ai_col1:
-            use_ai = st.checkbox("Use AI (Gemini)", value=True)
+            use_ai = st.checkbox("Use AI (DeepSeek)", value=True)
         with ai_col2:
-            model = st.selectbox("Gemini model", ["gemini-1.5-flash", "gemini-1.5-pro"], index=0)
+            model = st.selectbox("DeepSeek model", ["deepseek-chat", "deepseek-reasoner"], index=0)
 
         if st.button("Answer"):
             with st.spinner("Working…"):
                 results = store.search(question, top_k=top_k)
                 if use_ai:
-                    out = gemini_answer_from_context(question, results, model_name=model)
+                    out = deepseek_answer_from_context(question, results, model=model)
                 else:
                     out = answer_with_sentences(question, results, top_sentences=top_sents)
 
