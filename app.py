@@ -446,7 +446,7 @@ def main():
                 st.markdown(f"**{c['filename']}**  (page {c.get('page')}) — id `{c['id'][:8]}`")
                 st.code(c["text"][:1500] + ("..." if len(c["text"]) > 1500 else ""))
 
-    st.caption("Fast mode only: answers are extracted & cited from your documents. No AI APIs required.")
+    st.caption("Fast mode only: answers are extracted & cited from your documents.")
 
 if __name__ == "__main__":
     main()
