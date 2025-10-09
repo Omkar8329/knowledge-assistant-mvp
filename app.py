@@ -1,4 +1,4 @@
-# app.py — Knowledge Assistant (MVP) with DeepSeek RAG (no quick prompts)
+# app.py — Knowledge Assistant (MVP, Fast extractive Q&A only — no external LLMs)
 
 import os
 import io
@@ -22,6 +22,9 @@ from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 from reportlab.lib.units import inch
 
+# ----------------------------
+# App config
+# ----------------------------
 APP_TITLE = "Knowledge Assistant (MVP)"
 DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
 DATA_DIR.mkdir(exist_ok=True, parents=True)
@@ -35,7 +38,8 @@ SENTENCE_SPLIT_RE = re.compile(r'(?<=[.!?])\s+(?=[A-Z0-9“"(])')
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 
 # ----------------------------
-# Auth (single password)
+# Optional Auth (single password via env)
+#   - To disable, ensure APP_PASSWORD is not set
 # ----------------------------
 def check_auth():
     required = os.getenv("APP_PASSWORD")
@@ -118,7 +122,7 @@ class Store:
         self.dir = DATA_DIR / workspace
         self.dir.mkdir(exist_ok=True, parents=True)
         self.meta_path = self.dir / "meta.json"
-        self.raw_path = self.dir / "raw.json"
+        self.raw_path = self.dir / "raw.json"  # raw pages for Explain/Explore
 
         self.meta = {"docs": [], "chunks": []}
         self.raw_pages: Dict[str, List[Dict]] = {}
@@ -148,7 +152,7 @@ class Store:
         self.meta = {"docs": [], "chunks": []}
         self.raw_pages = {}
         self.vectorizer = None
-        self.matrix = None
+        self.matrix = None   # ← fixed indentation (aligned with the line above)
 
     def _rebuild_index(self):
         texts = [c["text"] for c in self.meta["chunks"]]
@@ -242,65 +246,6 @@ def answer_with_sentences(question: str, retrieved: List[Dict], top_sentences: i
     } for p in picks]
 
     return {"answer": answer_text, "citations": citations}
-
-# ----------------------------
-# DeepSeek synthesis over retrieved chunks (RAG)
-# ----------------------------
-def _compose_context_from_chunks(retrieved, max_chars=12000):
-    parts, total = [], 0
-    for r in retrieved:
-        ch = r["chunk"]
-        header = f"[FILE: {ch['filename']}" + (f" | PAGE: {ch.get('page')}" if ch.get("page") else "") + "]\n"
-        body = ch["text"].strip()
-        piece = header + body + "\n\n"
-        if total + len(piece) > max_chars:
-            break
-        parts.append(piece); total += len(piece)
-    return "".join(parts)
-
-def deepseek_answer_from_context(question, retrieved, model="deepseek-chat", temperature=0.2):
-    """
-    Use DeepSeek to answer based ONLY on the retrieved context.
-    Models: 'deepseek-chat' (default), 'deepseek-reasoner'
-    """
-    if not retrieved:
-        return {"answer": "No relevant content found in the knowledge base for this question.", "citations": []}
-
-    api_key = os.getenv("DEEPSEEK_API_KEY")
-    if not api_key:
-        return {"answer": "AI mode is enabled but no DEEPSEEK_API_KEY is set. Use Fast mode or set a key.", "citations": []}
-
-    # OpenAI-compatible client pointed to DeepSeek
-    from openai import OpenAI
-    client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
-
-    context = _compose_context_from_chunks(retrieved)
-    system = "Answer strictly from the provided context. If missing, say you cannot find it. Be concise for business users."
-    user = f"Question: {question}\n\nCONTEXT:\n{context}"
-
-    try:
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            temperature=temperature,
-        )
-        answer = (resp.choices[0].message.content or "").strip()
-
-        citations = []
-        for r in retrieved[:4]:
-            ch = r["chunk"]
-            citations.append({
-                "filename": ch["filename"],
-                "page": ch.get("page"),
-                "score": r["score"],
-                "preview": ch["text"][:200] + ("..." if len(ch["text"]) > 200 else "")
-            })
-        return {"answer": answer or "No answer produced by the model.", "citations": citations}
-    except Exception as e:
-        return {"answer": f"LLM error: {e}", "citations": []}
 
 # ----------------------------
 # Summarize & key facts (heuristics)
@@ -438,20 +383,10 @@ def main():
         with c3:
             top_sents = st.number_input("Sentences in answer", min_value=1, max_value=10, value=TOP_SENTENCES, step=1)
 
-        # AI mode (DeepSeek)
-        ai_col1, ai_col2 = st.columns([1.3, 2])
-        with ai_col1:
-            use_ai = st.checkbox("Use AI (DeepSeek)", value=True)
-        with ai_col2:
-            model = st.selectbox("DeepSeek model", ["deepseek-chat", "deepseek-reasoner"], index=0)
-
         if st.button("Answer"):
             with st.spinner("Working…"):
                 results = store.search(question, top_k=top_k)
-                if use_ai:
-                    out = deepseek_answer_from_context(question, results, model=model)
-                else:
-                    out = answer_with_sentences(question, results, top_sentences=top_sents)
+                out = answer_with_sentences(question, results, top_sentences=top_sents)
 
             st.markdown("### Answer")
             st.write(out["answer"] or "_No answer_")
@@ -511,7 +446,7 @@ def main():
                 st.markdown(f"**{c['filename']}**  (page {c.get('page')}) — id `{c['id'][:8]}`")
                 st.code(c["text"][:1500] + ("..." if len(c["text"]) > 1500 else ""))
 
-    st.caption("Answers are grounded in your documents. Verify critical decisions with the source files.")
+    st.caption("Fast mode only: answers are extracted & cited from your documents. No AI APIs required.")
 
 if __name__ == "__main__":
     main()
